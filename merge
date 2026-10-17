@@ -458,7 +458,7 @@ local selectedRockModel = nil   -- nil = best rock you can afford (auto)
 local AUTO_LABEL = "Best affordable (auto)"
 
 local function rockPart(m)
-    return m:FindFirstChild("Rock") or m.PrimaryPart
+    return m:FindFirstChild("Rock") or (m:IsA("Model") and m.PrimaryPart) or nil
 end
 local function rockNeed(m)
     local n = m:FindFirstChild("neededDurability")
@@ -471,8 +471,9 @@ local function scanRocks()
     local folder = workspace:FindFirstChild("machinesFolder")
     if not folder then return end
     local counts = {}
-    for _, m in ipairs(folder:GetChildren()) do
-        if m:IsA("Model") and m:FindFirstChild("neededDurability") and rockPart(m) and rockPart(m):IsA("BasePart") then
+    for _, nd in ipairs(folder:GetDescendants()) do
+        local m = nd.Name == "neededDurability" and nd.Parent
+        if m and rockPart(m) and rockPart(m):IsA("BasePart") then
             table.insert(rockEntries, {model = m, need = rockNeed(m), part = rockPart(m)})
             counts[m.Name] = (counts[m.Name] or 0) + 1
         end
@@ -649,8 +650,8 @@ local function enterKing()
     local r = hrp()
     if not r then return end
     local circle = findKingCircle()
-    if not circle then
-        tp(CFrame.new(kingPortal))     -- can't find it; walk onto the circle and retry
+    if not circle or not rEvents:FindFirstChild("areaTravelRemote") then
+        tp(kingPos)                    -- older version without the travel circle: plain teleport
         return
     end
     -- stand on the circle first so any server-side proximity check passes
@@ -776,10 +777,16 @@ local function ensurePunch()
 end
 local function hit(p)
     local c = LP.Character
-    local r, l = c and c:FindFirstChild("RightHand"), c and c:FindFirstChild("LeftHand")
     local root = alive(p)
-    if not (r and l and root) then return end
-    for _, h in ipairs({r, l}) do
+    if not (c and root) then return end
+    local hands = {}
+    for _, n in ipairs({"RightHand", "LeftHand", "Right Arm", "Left Arm"}) do
+        local h = c:FindFirstChild(n)
+        if h then table.insert(hands, h) end
+    end
+    if #hands == 0 then return end
+    if not c:FindFirstChild("Punch") then ensurePunch() end
+    for _, h in ipairs(hands) do
         firetouchinterest(h, root, 0)
         firetouchinterest(h, root, 1)
     end
@@ -951,22 +958,60 @@ Kill:AddSwitch("Remove Punch Animation", function(on)
 end)
 
 Kill:AddLabel("Brawls").TextSize = 22
+-- This version: ReplicatedStorage.Configs holds brawlPhase ("Idle"/"Joining"/"Starting"/"Active"),
+-- brawlRound, brawlStarted, brawlInProgress. Joining = brawlEvent:FireServer("joinBrawl", <current round>);
+-- the server ignores a join without the round number, and attacks are blocked until the brawl is Active.
+local brawlCfg = RS:FindFirstChild("Configs")
+local function bcfg(name) return brawlCfg and brawlCfg:FindFirstChild(name) end
+local function inBrawl(p)
+    local c = (p or LP).Character
+    return c ~= nil and c:FindFirstChild("lastMapCFrame") ~= nil   -- the game adds this to fighters
+end
+local function joinBrawl()
+    local round = bcfg("brawlRound")
+    if round then
+        rEvents.brawlEvent:FireServer("joinBrawl", round.Value)
+    else
+        rEvents.brawlEvent:FireServer("joinBrawl")                   -- older versions: no round argument
+    end
+end
+local lastJoinedRound = -1
 local function joinBrawlIfPrompted()
+    local phase, round = bcfg("brawlPhase"), bcfg("brawlRound")
+    if phase and round then
+        if phase.Value == "Joining" and round.Value ~= lastJoinedRound and not inBrawl() then
+            lastJoinedRound = round.Value
+            joinBrawl()
+        end
+        return
+    end
+    -- old layout fallback
     local gg = LP.PlayerGui:FindFirstChild("gameGui")
-    if gg and gg.brawlJoinLabel.Visible then
-        rEvents.brawlEvent:FireServer("joinBrawl")
+    if gg and gg:FindFirstChild("brawlJoinLabel") and gg.brawlJoinLabel.Visible then
+        joinBrawl()
         gg.brawlJoinLabel.Visible = false
     end
 end
-Kill:AddSwitch("God Mode (spam join brawl)", loopSwitch("godMode", 0, function() rEvents.brawlEvent:FireServer("joinBrawl") end))
-Kill:AddSwitch("Auto Join Brawls", loopSwitch("autoJoin", 0.5, joinBrawlIfPrompted))
+local function brawlActive()
+    local started, phase = bcfg("brawlStarted"), bcfg("brawlPhase")
+    if phase then return phase.Value == "Active" end
+    if started then return started.Value end
+    local old = RS:FindFirstChild("brawlInProgress", true)
+    return old and old.Value
+end
+
+Kill:AddSwitch("God Mode (spam join brawl)", loopSwitch("godMode", 0, joinBrawl))
+Kill:AddSwitch("Auto Join Brawls", loopSwitch("autoJoin", 0.25, joinBrawlIfPrompted))
 Kill:AddSwitch("Auto Win Brawls", loopSwitch("autoWin", 0.05, function()
     joinBrawlIfPrompted()
-    if RS.brawlInProgress.Value then
-        ensurePunch()
-        for _, p in ipairs(Players:GetPlayers()) do if p ~= LP then hit(p) end end
+    if not brawlActive() then return end              -- attacks are blocked until it starts
+    ensurePunch()
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LP and (not brawlCfg or inBrawl(p)) then hit(p) end   -- only the other fighters
     end
 end))
+
+
 
 Kill:AddLabel("Players").TextSize = 22
 local specTarget
@@ -1278,70 +1323,153 @@ Music:AddButton("Clear Playlist", function() playlist = {} idx = 0 savePlaylist(
 
 ----------------------------------------------------------------------
 -- MILLION WARRIOR KILLER
--- Pure coordinate teleport: goes to each recorded spot 1 by 1 on repeat, auto punch on.
+-- Workspace.enemyNPCs["Battle Island"] has one "enemySpawn" folder per enemy:
+--   enemySpawn.stats.Health / MaxHealth (NumberValues)  +  the enemy Model (with HumanoidRootPart).
+-- Visits every ALIVE enemy one by one (following it as it moves), auto punch on, repeats forever.
+-- Falls back to the recorded coordinates if the enemy folders can't be found.
 ----------------------------------------------------------------------
-local battleIslandNPCs = {
-    { name = "Hank", pos = Vector3.new(-4904.69, 9.23, 3651.11) },
-    { name = "Mr. Serious", pos = Vector3.new(-5356.31, 15.63, 3724.16) },
-    { name = "Sky Hawk", pos = Vector3.new(-5015.58, 23.70, 3764.33) },
-    { name = "Slitherman", pos = Vector3.new(-4869.46, 15.63, 3817.51) },
-    { name = "Ice Ice", pos = Vector3.new(-4932.25, 16.81, 4005.14) },
-    { name = "Mask Of Gold", pos = Vector3.new(-5035.44, 19.28, 4094.55) },
-    { name = "Mr. Serious", pos = Vector3.new(-5200.25, 15.63, 4133.70) },
-    { name = "A. Gnatomy", pos = Vector3.new(-5384.51, 23.66, 4072.95) },
-    { name = "Sky Hawk", pos = Vector3.new(-5479.27, 23.70, 3969.61) },
-    { name = "Smiley", pos = Vector3.new(-5522.32, 22.04, 3805.46) },
-    { name = "Alien Girl", pos = Vector3.new(-5350.38, 16.78, 3521.58) },
-    { name = "A. Gnatomy", pos = Vector3.new(-5463.22, 23.66, 3619.46) },
+local mw = {
+    dwell = 20,        -- max seconds on one enemy before moving on
+    height = 0,        -- vertical offset
+    back = 4,          -- studs in front of the enemy
+    fallback = {
+        Vector3.new(-4904.69, 9.23, 3651.11), Vector3.new(-5356.31, 15.63, 3724.16), Vector3.new(-5015.58, 23.70, 3764.33),
+        Vector3.new(-4869.46, 15.63, 3817.51), Vector3.new(-4932.25, 16.81, 4005.14), Vector3.new(-5035.44, 19.28, 4094.55),
+        Vector3.new(-5200.25, 15.63, 4133.70), Vector3.new(-5384.51, 23.66, 4072.95), Vector3.new(-5479.27, 23.70, 3969.61),
+        Vector3.new(-5522.32, 22.04, 3805.46), Vector3.new(-5350.38, 16.78, 3521.58), Vector3.new(-5463.22, 23.66, 3619.46),
+    },
 }
-local mwDelay = 3   -- seconds spent at each coordinate
 
-local function mwPunch()
+-- every enemy slot: {spawn = folder, hp = Health value, max = MaxHealth value}
+function mw.slots()
+    local out = {}
+    local root = workspace:FindFirstChild("enemyNPCs")
+    if not root then return out end
+    for _, d in ipairs(root:GetDescendants()) do
+        if d.Name == "enemySpawn" and d:IsA("Folder") then
+            local st = d:FindFirstChild("stats")
+            local hp = st and st:FindFirstChild("Health")
+            if hp then table.insert(out, {spawn = d, hp = hp, max = st:FindFirstChild("MaxHealth")}) end
+        end
+    end
+    return out
+end
+
+-- the live enemy model + its root inside a slot (nil while it is dead / respawning)
+function mw.enemy(slot)
+    for _, m in ipairs(slot.spawn:GetChildren()) do
+        if m:IsA("Model") then
+            local r = m:FindFirstChild("HumanoidRootPart")
+            if r then return m, r end
+        end
+    end
+end
+
+function mw.punch(targetRoot)
+    local c = LP.Character
     local p = equipTool("Punch")
     if p then
         if p:FindFirstChild("attackTime") then p.attackTime.Value = 0 end
         pcall(function() p:Activate() end)
     end
+    if c and targetRoot then
+        for _, n in ipairs({"RightHand", "LeftHand"}) do
+            local h = c:FindFirstChild(n)
+            if h then
+                pcall(function() firetouchinterest(h, targetRoot, 0) firetouchinterest(h, targetRoot, 1) end)
+            end
+        end
+    end
     fire("punch", "rightHand") fire("punch", "leftHand")
 end
 
+function mw.go(pos, lookAt)
+    local r = hrp()
+    if not r then return end
+    local at = pos + Vector3.new(0, mw.height, mw.back)
+    r.CFrame = CFrame.lookAt(at, Vector3.new(lookAt.X, at.Y, lookAt.Z))
+    r.AssemblyLinearVelocity = Vector3.zero
+end
+
 MW:AddLabel("Million Warrior Killer").TextSize = 22
-local mwStatus = MW:AddLabel("Status: off")
-MW:AddTextBox("Seconds at each spot (default 3)", function(t)
+mw.status = MW:AddLabel("Status: off")
+MW:AddTextBox("Max seconds per enemy (default 20)", function(t)
     local n = tonumber(t)
-    if n and n > 0 then mwDelay = n end
+    if n and n > 0 then mw.dwell = n end
+end, {["clear"] = false})
+MW:AddTextBox("Distance in front of enemy (default 4)", function(t)
+    local n = tonumber(t)
+    if n then mw.back = n end
+end, {["clear"] = false})
+MW:AddTextBox("Height offset (default 0)", function(t)
+    local n = tonumber(t)
+    if n then mw.height = n end
 end, {["clear"] = false})
 
 MW:AddSwitch("Million Warrior Killer", function(on)
-    if on then
-        local id = {}
-        S.mwKiller = id
-        task.spawn(function()   -- auto punch
-            while S.mwKiller == id do
-                pcall(mwPunch)
-                task.wait(0.05)
-            end
-        end)
-        task.spawn(function()   -- teleport 1 by 1, repeat
-            while S.mwKiller == id do
-                for i, e in ipairs(battleIslandNPCs) do
+    if not on then
+        S.mwKiller = nil
+        pcall(function() mw.status.Text = "Status: off" end)
+        unequipTool("Punch")
+        return
+    end
+    local id = {}
+    S.mwKiller = id
+    task.spawn(function()   -- constant auto punch while enabled
+        while S.mwKiller == id do
+            pcall(mw.punch, mw.curRoot)
+            task.wait(0.05)
+        end
+        mw.curRoot = nil
+    end)
+    task.spawn(function()   -- teleport loop
+        local idx = 0
+        while S.mwKiller == id do
+            local slots = mw.slots()
+            if #slots == 0 then
+                -- enemy folders not found: just visit the recorded coordinates 1 by 1
+                for i, pos in ipairs(mw.fallback) do
                     if S.mwKiller ~= id then break end
-                    pcall(function() mwStatus.Text = string.format("Status: %d/%d  %s", i, #battleIslandNPCs, e.name) end)
+                    mw.curRoot = nil
+                    pcall(function() mw.status.Text = ("Status: spot %d/%d (recorded)"):format(i, #mw.fallback) end)
                     local t0 = tick()
-                    repeat
-                        local r = hrp()
-                        if r then
-                            r.CFrame = CFrame.new(e.pos + Vector3.new(0, 3, 0))
-                            r.AssemblyLinearVelocity = Vector3.zero
-                        end
+                    while S.mwKiller == id and tick() - t0 < 3 do
+                        mw.go(pos + Vector3.new(0, 3, -mw.back), pos)
                         task.wait()
-                    until S.mwKiller ~= id or tick() - t0 >= mwDelay
+                    end
+                end
+            else
+                -- next alive enemy after the last one we did (round-robin = 1 by 1, on repeat)
+                local picked
+                for step = 1, #slots do
+                    local sl = slots[(idx + step - 1) % #slots + 1]
+                    local m, r = mw.enemy(sl)
+                    if m and r and sl.hp.Value > 0 then
+                        picked = sl
+                        idx = (idx + step) % #slots
+                        break
+                    end
+                end
+                if not picked then
+                    mw.curRoot = nil
+                    pcall(function() mw.status.Text = "Status: all enemies dead, waiting for respawn..." end)
+                    task.wait(0.5)
+                else
+                    local t0 = tick()
+                    local slotIdx = idx == 0 and #slots or idx
+                    while S.mwKiller == id and tick() - t0 < mw.dwell do
+                        local m2, r2 = mw.enemy(picked)
+                        if not (m2 and r2) or picked.hp.Value <= 0 then break end   -- killed (or despawned)
+                        mw.curRoot = r2
+                        mw.go(r2.Position, r2.Position)
+                        pcall(function()
+                            mw.status.Text = ("Status: %d/%d  %s  (%s / %s HP)"):format(
+                                slotIdx, #slots, m2.Name, fmt(picked.hp.Value), picked.max and fmt(picked.max.Value) or "?")
+                        end)
+                        RunService.Heartbeat:Wait()
+                    end
                 end
             end
-        end)
-    else
-        S.mwKiller = nil
-        pcall(function() mwStatus.Text = "Status: off" end)
-        unequipTool("Punch")
-    end
+        end
+    end)
 end)
