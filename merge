@@ -775,17 +775,29 @@ local function ensurePunch()
     if t then t.Parent = c return true end
     return false
 end
-local function hit(p)
+local killTP = true   -- "Teleport to targets while killing"
+local function hit(p, noTP)
     local c = LP.Character
     local root = alive(p)
-    if not (c and root) then return end
+    local me = hrp()
+    if not (c and root and me) then return end
     local hands = {}
     for _, n in ipairs({"RightHand", "LeftHand", "Right Arm", "Left Arm"}) do
         local h = c:FindFirstChild(n)
         if h then table.insert(hands, h) end
     end
     if #hands == 0 then return end
-    if not c:FindFirstChild("Punch") then ensurePunch() end
+    -- real contact beats faked touches: stand right behind the target
+    if killTP and not noTP and (me.Position - root.Position).Magnitude > 4 then
+        me.CFrame = root.CFrame * CFrame.new(0, 0, 2)
+        me.AssemblyLinearVelocity = Vector3.zero
+    end
+    local tool = c:FindFirstChild("Punch")
+    if not tool then ensurePunch() tool = c:FindFirstChild("Punch") end
+    if tool then
+        if tool:FindFirstChild("attackTime") then tool.attackTime.Value = 0 end
+        pcall(function() tool:Activate() end)      -- the real swing (animation + punch event)
+    end
     for _, h in ipairs(hands) do
         firetouchinterest(h, root, 0)
         firetouchinterest(h, root, 1)
@@ -843,6 +855,8 @@ local function onKilllist(p)
 end
 
 Kill:AddLabel("Auto Kill").TextSize = 22
+local killTPSw = Kill:AddSwitch("Teleport to targets while killing", function(on) killTP = on end)
+pcall(function() killTPSw:Set(true) end)
 Kill:AddSwitch("Kill Everyone (except whitelist)", loopSwitch("killAll", 0.05, function()
     ensurePunch()
     for _, p in ipairs(Players:GetPlayers()) do
@@ -891,7 +905,7 @@ Kill:AddSwitch("Death Ring", function(on)
                 if root and (r.Position - root.Position).Magnitude <= deathRange then
                     any = true
                     ensurePunch()
-                    hit(p)
+                    hit(p, true)
                 end
             end
             if not any then unequipTool("Punch") end
@@ -1331,7 +1345,7 @@ Music:AddButton("Clear Playlist", function() playlist = {} idx = 0 savePlaylist(
 local mw = {
     dwell = 20,        -- max seconds on one enemy before moving on
     height = 0,        -- vertical offset
-    back = 4,          -- studs in front of the enemy
+    back = 2.5,        -- studs in front of the enemy
     fallback = {
         Vector3.new(-4904.69, 9.23, 3651.11), Vector3.new(-5356.31, 15.63, 3724.16), Vector3.new(-5015.58, 23.70, 3764.33),
         Vector3.new(-4869.46, 15.63, 3817.51), Vector3.new(-4932.25, 16.81, 4005.14), Vector3.new(-5035.44, 19.28, 4094.55),
@@ -1397,7 +1411,7 @@ MW:AddTextBox("Max seconds per enemy (default 20)", function(t)
     local n = tonumber(t)
     if n and n > 0 then mw.dwell = n end
 end, {["clear"] = false})
-MW:AddTextBox("Distance in front of enemy (default 4)", function(t)
+MW:AddTextBox("Distance in front of enemy (default 2.5)", function(t)
     local n = tonumber(t)
     if n then mw.back = n end
 end, {["clear"] = false})
@@ -1472,4 +1486,40 @@ MW:AddSwitch("Million Warrior Killer", function(on)
             end
         end
     end)
+end)
+
+----------------------------------------------------------------------
+-- INFO: Destroy GUI (stops every loop, removes the hub)
+----------------------------------------------------------------------
+Info:AddButton("Destroy GUI", function()
+    -- stop every running loop / connection
+    for k, v in pairs(S) do
+        if typeof(v) == "RBXScriptConnection" then pcall(function() v:Disconnect() end) end
+        S[k] = nil
+    end
+    pcall(unequipTool, "Punch")
+    pcall(function() if ringPart then ringPart:Destroy() ringPart = nil end end)
+    pcall(function()
+        local snd = SoundService:FindFirstChild("UnifiedHubSound")
+        if snd then snd:Stop() snd:Destroy() end
+    end)
+    -- find and remove the hub's ScreenGui (the one containing the "Unified Hub" title)
+    local roots = {}
+    pcall(function() table.insert(roots, game:GetService("CoreGui")) end)
+    pcall(function() if gethui then table.insert(roots, gethui()) end end)
+    pcall(function() table.insert(roots, LP:FindFirstChildOfClass("PlayerGui")) end)
+    for _, root in ipairs(roots) do
+        for _, g in ipairs(root:GetChildren()) do
+            if g:IsA("ScreenGui") then
+                local found = false
+                for _, d in ipairs(g:GetDescendants()) do
+                    if (d:IsA("TextLabel") or d:IsA("TextButton")) and tostring(d.Text):find("Unified Hub", 1, true) then
+                        found = true
+                        break
+                    end
+                end
+                if found then pcall(function() g:Destroy() end) end
+            end
+        end
+    end
 end)
