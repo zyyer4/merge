@@ -561,55 +561,17 @@ infiniteSw = Farm:AddSwitch("Auto Rebirth (infinite)", function(on)
 end)
 
 local kingPos = CFrame.new(-8665.4, 17.21, -5792.9)
-local kingPortal = Vector3.new(-123, 18, -710)   -- the "Travel to Muscle King?" portal
-local GuiService = game:GetService("GuiService")
+local kingPortal = Vector3.new(-123, 18, -710)   -- fallback: the "Travel to Muscle King?" circle
+local kingCooldown = 0
 
-local function guiShown(g)
-    while g and g:IsA("GuiObject") do
-        if not g.Visible then return false end
-        g = g.Parent
+-- the game's own travel circle for Muscle King (workspace.areaCircles.<model> with areaName = "Muscle King")
+local function findKingCircle()
+    local folder = workspace:FindFirstChild("areaCircles")
+    if not folder then return nil end
+    for _, m in ipairs(folder:GetChildren()) do
+        local n = m:FindFirstChild("areaName")
+        if m:IsA("Model") and n and n.Value == "Muscle King" then return m end
     end
-    while g and g ~= game do
-        if g:IsA("ScreenGui") and not g.Enabled then return false end
-        g = g.Parent
-    end
-    return true
-end
-
--- finds the visible YES button of the travel prompt
-local function findYes()
-    local pg = LP:FindFirstChild("PlayerGui")
-    if not pg then return nil end
-    for _, d in ipairs(pg:GetDescendants()) do
-        if (d:IsA("TextButton") or d:IsA("TextLabel")) and tostring(d.Text):upper():match("^%s*YES%s*$") then
-            local btn = d
-            if d:IsA("TextLabel") then
-                local a = d
-                while a and not a:IsA("GuiButton") and a ~= pg do a = a.Parent end
-                if a and a:IsA("GuiButton") then btn = a end
-            end
-            if guiShown(btn) and btn.AbsoluteSize.X > 0 then return btn end
-        end
-    end
-end
-
-local function clickGui(btn)
-    -- 1) fire the button's own connections (works on most executors)
-    if getconnections then
-        for _, sig in ipairs({"MouseButton1Click", "Activated", "MouseButton1Down", "MouseButton1Up"}) do
-            pcall(function()
-                for _, c in ipairs(getconnections(btn[sig])) do pcall(function() c:Fire() end) end
-            end)
-        end
-    end
-    -- 2) real mouse click on the button
-    pcall(function()
-        local vim = game:GetService("VirtualInputManager")
-        local pos = btn.AbsolutePosition + btn.AbsoluteSize / 2 + GuiService:GetGuiInset()
-        vim:SendMouseButtonEvent(pos.X, pos.Y, 0, true, game, 0)
-        task.wait(0.05)
-        vim:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 0)
-    end)
 end
 
 local function inKingGym()
@@ -617,30 +579,29 @@ local function inKingGym()
     return r and (r.Position - kingPos.Position).Magnitude < 400
 end
 
--- enter through the portal prompt first (so the game registers you as king), then go to the gym spot
+-- same thing the YES button does: InvokeServer("travelToArea", circle). No GUI clicking.
 local function enterKing()
+    if tick() < kingCooldown then return end
+    kingCooldown = tick() + 6          -- never retry faster than this
     local r = hrp()
     if not r then return end
-    r.CFrame = CFrame.new(kingPortal)
-    local btn
-    local t0 = tick()
-    while tick() - t0 < 4 and not btn do
-        task.wait(0.1)
-        local rr = hrp()
-        if rr and (rr.Position - kingPortal).Magnitude > 15 then rr.CFrame = CFrame.new(kingPortal) end
-        btn = findYes()
-    end
-    if btn then
-        clickGui(btn)
-        -- wait for the game to actually move us into the gym
-        local t1 = tick()
-        while tick() - t1 < 6 and not inKingGym() do task.wait(0.1) end
-        task.wait(0.3)
-    else
-        task.wait(1)   -- prompt didn't show; retry the portal next cycle
+    local circle = findKingCircle()
+    if not circle then
+        tp(CFrame.new(kingPortal))     -- can't find it; walk onto the circle and retry
         return
     end
-    tp(kingPos)
+    -- stand on the circle first so any server-side proximity check passes
+    local inner = circle:FindFirstChild("circleInner")
+    tp(CFrame.new((inner and inner:IsA("BasePart") and inner.Position or kingPortal) + Vector3.new(0, 3, 0)))
+    task.wait(0.4)
+    pcall(function() rEvents.areaTravelRemote:InvokeServer("travelToArea", circle) end)
+    -- hands off the character while the game moves us
+    local t1 = tick()
+    while tick() - t1 < 8 and not inKingGym() do task.wait(0.2) end
+    if inKingGym() then
+        task.wait(0.5)
+        tp(kingPos)
+    end
 end
 
 Farm:AddSwitch("Auto Teleport to Muscle King", loopSwitch("king", 0.1, function()
