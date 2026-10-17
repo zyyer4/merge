@@ -21,7 +21,16 @@ local SoundService = game:GetService("SoundService")
 local LP = Players.LocalPlayer
 local rEvents = RS:WaitForChild("rEvents")
 
-local library = loadstring(game:HttpGet("https://raw.githubusercontent.com/memejames/elerium-v2-ui-library/main/Library", true))()
+local okLib, library = pcall(function()
+    return loadstring(game:HttpGet("https://raw.githubusercontent.com/memejames/elerium-v2-ui-library/main/Library", true))()
+end)
+if not okLib or type(library) ~= "table" then
+    pcall(function()
+        StarterGui:SetCore("SendNotification", {Title = "Unified Hub", Text = "UI library failed to download. Check your connection / executor and re-run.", Duration = 8})
+    end)
+    warn("[Unified Hub] UI library failed to load: " .. tostring(library))
+    return
+end
 local window = library:AddWindow("Unified Hub | Hello " .. (LP.DisplayName ~= "" and LP.DisplayName or LP.Name), {
     main_color = Color3.fromRGB(110, 70, 230),
     min_size = Vector2.new(640, 720),
@@ -37,7 +46,10 @@ local function notify(title, text, dur)
     pcall(function() StarterGui:SetCore("SendNotification", {Title = title, Text = text, Duration = dur or 3}) end)
 end
 
-local function fire(...) pcall(function() LP.muscleEvent:FireServer(...) end) end
+local function fire(...)
+    local ev = LP:FindFirstChild("muscleEvent")
+    if ev then pcall(ev.FireServer, ev, ...) end
+end
 local function hrp() local c = LP.Character return c and c:FindFirstChild("HumanoidRootPart") end
 local function hum() local c = LP.Character return c and c:FindFirstChildOfClass("Humanoid") end
 local function tp(cf) local r = hrp() if r then r.CFrame = cf end end
@@ -91,9 +103,14 @@ local function getP(text)
     return n and Players:FindFirstChild(n)
 end
 local function refill(e)
-    e.d:Clear()
+    -- the Elerium dropdown has no :Clear(); each :Add() returns an object with :Remove()
+    for _, o in ipairs(e.items) do pcall(function() o:Remove() end) end
+    e.items = {}
     for _, p in ipairs(Players:GetPlayers()) do
-        if e.self or p ~= LP then e.d:Add(pText(p)) end
+        if e.self or p ~= LP then
+            local ok, o = pcall(function() return e.d:Add(pText(p)) end)
+            if ok and o then table.insert(e.items, o) end
+        end
     end
 end
 local function playerDrop(parent, title, cb, includeSelf)
@@ -101,7 +118,7 @@ local function playerDrop(parent, title, cb, includeSelf)
         local p = getP(t)
         if p then cb(p) end
     end)
-    local e = {d = d, self = includeSelf}
+    local e = {d = d, self = includeSelf, items = {}}
     table.insert(playerDrops, e)
     refill(e)
     return d
@@ -129,6 +146,8 @@ local Tele = window:AddTab("Teleport")
 local StatsT = window:AddTab("Stats")
 local Calc = window:AddTab("Calculator")
 local Music = window:AddTab("Music")
+
+Main:Show()
 
 Info:AddLabel("UNIFIED HUB  -  Muscle Legends").TextSize = 22
 Info:AddLabel("Built from Mystery / Genesis / Rafael / DAN hubs, duplicates removed.")
@@ -416,7 +435,7 @@ Farm:AddSwitch("Auto Eat Egg (timed)", function(on)
             while S.eggTimed == id do
                 pcall(eatEgg)
                 local waited = 0
-                while S.eggTimed == id and waited < eggInterval do task.wait(1) waited += 1 end
+                while S.eggTimed == id and waited < eggInterval do task.wait(1) waited = waited + 1 end
             end
         end)
     else S.eggTimed = nil end
@@ -597,7 +616,7 @@ Farm:AddButton("Equip 8x Swift Samurai", function()
         for _, pet in ipairs(folder:GetChildren()) do
             if pet.Name == "Swift Samurai" and n < 8 then
                 rEvents.equipPetEvent:FireServer("equipPet", pet)
-                n += 1
+                n = n + 1
             end
         end
     end
@@ -659,7 +678,7 @@ local killPetDrop = Kill:AddDropdown("Select Pet (damage / durability)", functio
     for _, pet in ipairs(f.Unique:GetChildren()) do
         if pet.Name == name and n < 8 then
             rEvents.equipPetEvent:FireServer("equipPet", pet)
-            n += 1
+            n = n + 1
             task.wait(0.1)
         end
     end
@@ -943,7 +962,7 @@ task.spawn(function()
     while task.wait(0.5) do
         local eggs, shakes = 0, 0
         for _, i in ipairs(LP.Backpack:GetChildren()) do
-            if i.Name == "Protein Egg" then eggs += 1 elseif i.Name == "Tropical Shake" then shakes += 1 end
+            if i.Name == "Protein Egg" then eggs = eggs + 1 elseif i.Name == "Tropical Shake" then shakes = shakes + 1 end
         end
         giftCountLabel.Text = "Protein Eggs: " .. eggs .. " | Tropical Shakes: " .. shakes
     end
@@ -1000,7 +1019,8 @@ local startTime, hist = tick(), {Strength = {}, Durability = {}}
 task.spawn(function()
     while task.wait(1) do
         local e = tick() - startTime
-        timeLabel.Text = string.format("%dd %dh %dm %ds", e // 86400, (e % 86400) // 3600, (e % 3600) // 60, e % 60)
+        e = math.floor(e)
+        timeLabel.Text = string.format("%dd %dh %dm %ds", math.floor(e / 86400), math.floor((e % 86400) / 3600), math.floor((e % 3600) / 60), e % 60)
         for _, d in ipairs(statDefs) do
             local s = getStat(LP, d[2])
             if s then
@@ -1034,13 +1054,13 @@ local function multiplier(plr, ultName, perLevel, petA, petB)
     local m = 1
     local uf = plr:FindFirstChild("ultimatesFolder")
     local u = uf and uf:FindFirstChild(ultName)
-    if u then m += perLevel * (u.Value or 0) end
+    if u then m = m + perLevel * (u.Value or 0) end
     local ep = plr:FindFirstChild("equippedPets")
     if ep then
         for _, v in ipairs(ep:GetChildren()) do
             if v:IsA("ObjectValue") and v.Value then
                 local n = v.Value.Name:lower()
-                if n:find(petA) and n:find(petB) then m += 0.5 end
+                if n:find(petA) and n:find(petB) then m = m + 0.5 end
             end
         end
     end
@@ -1096,11 +1116,11 @@ pcall(function()
 end)
 local function savePlaylist() pcall(function() writefile(playlistFile, table.concat(playlist, ",")) end) end
 local timeLbl = Music:AddLabel("00:00 / 00:00")
-local function mmss(s) s = math.floor(s or 0) return string.format("%02d:%02d", s // 60, s % 60) end
+local function mmss(s) s = math.floor(s or 0) return string.format("%02d:%02d", math.floor(s / 60), s % 60) end
 
 local function playUrl(url)
     if url == "" then return end
-    fileCount += 1
+    fileCount = fileCount + 1
     local f = "UnifiedHubMusic_" .. fileCount .. ".mp3"
     local ok = pcall(function() writefile(f, game:HttpGet(url)) end)
     if not ok then notify("Music", "Could not download that URL") return end
@@ -1135,5 +1155,3 @@ Music:AddButton("Play Playlist", function() if #playlist > 0 then idx = 1 playUr
 Music:AddButton("Next", function() if #playlist > 0 then idx = idx % #playlist + 1 playUrl(playlist[idx]) end end)
 Music:AddButton("Previous", function() if #playlist > 0 then idx = (idx - 2) % #playlist + 1 playUrl(playlist[idx]) end end)
 Music:AddButton("Clear Playlist", function() playlist = {} idx = 0 savePlaylist() end)
-
-Main:Show()
