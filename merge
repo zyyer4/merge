@@ -140,6 +140,7 @@ local Info = window:AddTab("Info")
 local Main = window:AddTab("Main")
 local Farm = window:AddTab("Farming")
 local Kill = window:AddTab("Killing")
+local MW = window:AddTab("Warrior Killer")
 local Pets = window:AddTab("Pets")
 local Inv = window:AddTab("Inventory")
 local Tele = window:AddTab("Teleport")
@@ -165,15 +166,22 @@ end)
 ----------------------------------------------------------------------
 Main:AddLabel("Character").TextSize = 22
 
-local userSize, userSpeed = 2, 120
-Main:AddTextBox("Size", function(t) local v = tonumber(t) if v and v > 0 then userSize = v end end)
-Main:AddSwitch("Set Size", loopSwitch("size", 0.15, function()
-    rEvents.changeSpeedSizeRemote:InvokeServer("changeSize", userSize)
-end))
-Main:AddTextBox("Speed", function(t) local v = tonumber(t) if v and v > 0 then userSpeed = v end end)
-Main:AddSwitch("Set Speed", loopSwitch("speed", 0.15, function()
-    rEvents.changeSpeedSizeRemote:InvokeServer("changeSpeed", userSpeed)
-end))
+-- Speed / Size: Empire's settings (apply when you submit the box)
+Main:AddTextBox("Speed", function(value)
+    local speed = tonumber(value)
+    if not speed then return end
+    _G.AutoSpeed = true
+    local h = hum()
+    if h then h.WalkSpeed = speed end
+end)
+Main:AddTextBox("Size", function(value)
+    local size = tonumber(value)
+    if not size then return end
+    _G.AutoSize = true
+    pcall(function()
+        rEvents.changeSpeedSizeRemote:InvokeServer("changeSize", size)
+    end)
+end)
 
 local userJump = 100
 Main:AddTextBox("Jump Power", function(t) local v = tonumber(t) if v and v > 0 then userJump = v end end)
@@ -1155,3 +1163,109 @@ Music:AddButton("Play Playlist", function() if #playlist > 0 then idx = 1 playUr
 Music:AddButton("Next", function() if #playlist > 0 then idx = idx % #playlist + 1 playUrl(playlist[idx]) end end)
 Music:AddButton("Previous", function() if #playlist > 0 then idx = (idx - 2) % #playlist + 1 playUrl(playlist[idx]) end end)
 Music:AddButton("Clear Playlist", function() playlist = {} idx = 0 savePlaylist() end)
+
+
+----------------------------------------------------------------------
+-- MILLION WARRIOR KILLER
+-- Teleports to every high-HP enemy (non-player Humanoid) one by one, on repeat,
+-- while spamming punch. Switch it off to stop.
+----------------------------------------------------------------------
+local mwMinHP, mwDwell, mwHeight = 500000, 4, 0   -- min MaxHealth to count, max seconds per enemy, vertical offset
+local mwStatus
+
+local function mwIsPlayerChar(m)
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p.Character == m then return true end
+    end
+    return false
+end
+
+local function mwScan()
+    local list = {}
+    for _, d in ipairs(workspace:GetDescendants()) do
+        if d:IsA("Humanoid") and d.Health > 0 and d.MaxHealth >= mwMinHP then
+            local m = d.Parent
+            local root = m and (m:FindFirstChild("HumanoidRootPart") or m.PrimaryPart or m:FindFirstChildWhichIsA("BasePart"))
+            if root and m ~= LP.Character and not mwIsPlayerChar(m) then
+                table.insert(list, {model = m, hum = d, root = root})
+            end
+        end
+    end
+    -- nearest first, so the route is sensible
+    local me = hrp()
+    if me then
+        table.sort(list, function(a, b)
+            return (a.root.Position - me.Position).Magnitude < (b.root.Position - me.Position).Magnitude
+        end)
+    end
+    return list
+end
+
+local function mwPunch()
+    local p = equipTool("Punch")
+    if p then
+        if p:FindFirstChild("attackTime") then p.attackTime.Value = 0 end
+        pcall(function() p:Activate() end)
+    end
+    fire("punch", "rightHand") fire("punch", "leftHand")
+end
+
+MW:AddLabel("Million Warrior Killer").TextSize = 22
+mwStatus = MW:AddLabel("Status: off")
+MW:AddTextBox("Min enemy max HP (default 500000)", function(t)
+    local n = parseAmount(t)
+    if n > 0 then mwMinHP = n end
+end, {["clear"] = false})
+MW:AddTextBox("Max seconds per enemy (default 4)", function(t)
+    local n = tonumber(t)
+    if n and n > 0 then mwDwell = n end
+end, {["clear"] = false})
+MW:AddTextBox("Height offset (default 0)", function(t)
+    local n = tonumber(t)
+    if n then mwHeight = n end
+end, {["clear"] = false})
+
+MW:AddSwitch("Million Warrior Killer", function(on)
+    if on then
+        local id = {}
+        S.mwKiller = id
+        -- constant punching while enabled
+        task.spawn(function()
+            while S.mwKiller == id do
+                pcall(mwPunch)
+                task.wait(0.05)
+            end
+        end)
+        -- teleport loop
+        task.spawn(function()
+            while S.mwKiller == id do
+                local targets = mwScan()
+                if #targets == 0 then
+                    pcall(function() mwStatus.Text = "Status: no enemies found, rescanning..." end)
+                    task.wait(1)
+                else
+                    for i, t in ipairs(targets) do
+                        if S.mwKiller ~= id then break end
+                        local started = tick()
+                        while S.mwKiller == id and t.hum.Parent and t.hum.Health > 0 and tick() - started < mwDwell do
+                            local me = hrp()
+                            if me and t.root.Parent then
+                                me.CFrame = t.root.CFrame * CFrame.new(0, mwHeight, 2)
+                                me.AssemblyLinearVelocity = Vector3.zero
+                            end
+                            pcall(function()
+                                mwStatus.Text = string.format("Status: %d/%d  %s  (%s HP)", i, #targets, t.model.Name, fmt(t.hum.Health))
+                            end)
+                            RunService.Heartbeat:Wait()
+                        end
+                    end
+                end
+                task.wait()
+            end
+        end)
+    else
+        S.mwKiller = nil
+        pcall(function() mwStatus.Text = "Status: off" end)
+        unequipTool("Punch")
+    end
+end)
