@@ -450,53 +450,116 @@ Farm:AddSwitch("Auto Eat Egg (timed)", function(on)
 end)
 
 Farm:AddLabel("Rocks").TextSize = 22
-local rocks = {
-    {"Tiny Rock (0)", 0}, {"Starter Island Rock (100)", 100}, {"Punching Rock (1K)", 1000}, {"Legend Beach Rock (5K)", 5000},
-    {"Frost Rock (150K)", 150000}, {"Mythical Rock (400K)", 400000}, {"Eternal/Inferno Rock (750K)", 750000},
-    {"Legends Rock (1M)", 1000000}, {"Muscle King Rock (5M)", 5000000}, {"Jungle Rock (10M)", 10000000},
-}
-local selectedRock = rocks[#rocks]
-local rockDrop = Farm:AddDropdown("Select Rock", function(t)
-    for _, r in ipairs(rocks) do if r[1] == t then selectedRock = r end end
-end)
-for _, r in ipairs(rocks) do rockDrop:Add(r[1]) end
+-- Rocks are read live from workspace.machinesFolder (Model with a "Rock" part + "neededDurability"),
+-- so new/changed rocks and durability requirements are picked up automatically.
+local rockEntries = {}      -- {label, model, need}
+local rockItems = {}        -- dropdown items, so the list can be rebuilt
+local selectedRockModel = nil   -- nil = best rock you can afford (auto)
+local AUTO_LABEL = "Best affordable (auto)"
 
-local function findRock(dur)
-    for _, v in ipairs(workspace.machinesFolder:GetDescendants()) do
-        if v.Name == "neededDurability" and v.Value == dur then
-            local r = v.Parent:FindFirstChild("Rock")
-            if r then return r end
+local function rockPart(m)
+    return m:FindFirstChild("Rock") or m.PrimaryPart
+end
+local function rockNeed(m)
+    local n = m:FindFirstChild("neededDurability")
+    return n and tonumber(n.Value) or 0
+end
+
+local rockDrop
+local function scanRocks()
+    rockEntries = {}
+    local folder = workspace:FindFirstChild("machinesFolder")
+    if not folder then return end
+    local counts = {}
+    for _, m in ipairs(folder:GetChildren()) do
+        if m:IsA("Model") and m:FindFirstChild("neededDurability") and rockPart(m) and rockPart(m):IsA("BasePart") then
+            table.insert(rockEntries, {model = m, need = rockNeed(m), part = rockPart(m)})
+            counts[m.Name] = (counts[m.Name] or 0) + 1
         end
     end
-end
-local cachedRock, cachedDur
-local function hitRock()
-    local dur = selectedRock[2]
-    if cachedDur ~= dur or not cachedRock or not cachedRock.Parent then
-        cachedRock, cachedDur = findRock(dur), dur
+    table.sort(rockEntries, function(x, y)
+        if x.need ~= y.need then return x.need < y.need end
+        return x.model.Name < y.model.Name
+    end)
+    for _, e in ipairs(rockEntries) do
+        local pos = e.part.Position
+        local where = counts[e.model.Name] > 1 and string.format(" @ %d, %d", pos.X, pos.Z) or ""
+        e.label = string.format("%s (%s)%s", e.model.Name, fmt(e.need), where)
     end
+end
+local function fillRockDrop()
+    for _, o in ipairs(rockItems) do pcall(function() o:Remove() end) end
+    rockItems = {}
+    local function add(t)
+        local ok, o = pcall(function() return rockDrop:Add(t) end)
+        if ok and o then table.insert(rockItems, o) end
+    end
+    add(AUTO_LABEL)
+    for _, e in ipairs(rockEntries) do add(e.label) end
+end
+
+scanRocks()
+rockDrop = Farm:AddDropdown("Select Rock", function(t)
+    selectedRockModel = nil
+    for _, e in ipairs(rockEntries) do
+        if e.label == t then selectedRockModel = e.model end
+    end
+end)
+fillRockDrop()
+Farm:AddButton("Refresh Rock List", function() scanRocks() fillRockDrop() notify("Rocks", #rockEntries .. " rocks found") end)
+
+-- the rock to hit right now: the selected one, or the hardest one your Durability allows
+local function targetRock()
+    local dur = LP:FindFirstChild("Durability") and LP.Durability.Value or 0
+    if selectedRockModel then
+        if not selectedRockModel.Parent then scanRocks() selectedRockModel = nil return nil end
+        if rockNeed(selectedRockModel) > dur then return nil end
+        return rockPart(selectedRockModel)
+    end
+    local best
+    for _, e in ipairs(rockEntries) do
+        if e.model.Parent then
+            local need = rockNeed(e.model)
+            if need <= dur and (not best or need >= best.need) then best = {need = need, part = rockPart(e.model)} end
+        end
+    end
+    return best and best.part
+end
+
+local function myHands()
     local c = LP.Character
-    if cachedRock and c and c:FindFirstChild("LeftHand") and c:FindFirstChild("RightHand") and LP.Durability.Value >= dur then
-        for _, h in ipairs({c.RightHand, c.LeftHand}) do
-            firetouchinterest(cachedRock, h, 0)
-            firetouchinterest(cachedRock, h, 1)
-        end
-        equipTool("Punch")
-        fire("punch", "rightHand") fire("punch", "leftHand")
+    if not c then return {} end
+    local out = {}
+    for _, n in ipairs({"RightHand", "LeftHand", "Right Arm", "Left Arm"}) do
+        local h = c:FindFirstChild(n)
+        if h and h:IsA("BasePart") then table.insert(out, h) end
     end
+    return out
 end
-Farm:AddSwitch("Auto Rock", loopSwitch("autoRock", 0.001, hitRock))
+
+-- hits the rock from anywhere on the map (touch is faked, no need to be near it)
+local function hitRock()
+    local rock = targetRock()
+    if not rock then return end
+    for _, h in ipairs(myHands()) do
+        firetouchinterest(rock, h, 0)
+        firetouchinterest(rock, h, 1)
+    end
+    equipTool("Punch")
+    fire("punch", "rightHand") fire("punch", "leftHand")
+end
+Farm:AddSwitch("Auto Rock (works from afar)", loopSwitch("autoRock", 0.03, hitRock))
 Farm:AddSwitch("Rock + Tool Combo (uses selected tool & rock)", loopSwitch("combo", 0, function()
     if selectedTool ~= "Punch" and selectedTool ~= "Stomp" and selectedTool ~= "Ground Slam" then
         equipTool(selectedTool)
         fire("rep")
     end
-    local c = LP.Character
-    local rock = cachedRock and cachedRock.Parent and cachedRock or findRock(selectedRock[2])
-    cachedRock, cachedDur = rock, selectedRock[2]
-    if rock and c and c:FindFirstChild("LeftHand") then
-        firetouchinterest(rock, c.LeftHand, 0)
-        firetouchinterest(rock, c.LeftHand, 1)
+    local rock = targetRock()
+    if rock then
+        for _, h in ipairs(myHands()) do
+            firetouchinterest(rock, h, 0)
+            firetouchinterest(rock, h, 1)
+        end
     end
     fire("punch", "rightHand") fire("punch", "leftHand")
 end))
